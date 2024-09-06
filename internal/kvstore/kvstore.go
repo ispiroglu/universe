@@ -8,6 +8,8 @@ import (
 	csmap "github.com/mhmtszr/concurrent-swiss-map"
 )
 
+// TODO: gracefull shutdown
+// TODO: Write ahead logging
 type KvStore struct {
 	sm *csmap.CsMap[string, []byte]
 	p  *Persistence
@@ -65,6 +67,14 @@ func (kvs *KvStore) Delete(k string) {
 	kvs.sm.Delete(k)
 }
 
+func (kvs *KvStore) SaveToDisk() error {
+	return kvs.p.save(kvs)
+}
+
+func (kvs *KvStore) LoadFromDisk() error {
+	return kvs.p.load(kvs)
+}
+
 // TODO: Faster(bulk) marshall?
 func (kvs *KvStore) marshalBinary() ([]byte, error) {
 	var buf bytes.Buffer
@@ -96,12 +106,4 @@ func (kvs *KvStore) unmarshalBinary(data []byte) error {
 	}
 
 	return nil
-}
-
-func (kvs *KvStore) SaveToDisk() error {
-	return kvs.p.save(kvs)
-}
-
-func (kvs *KvStore) LoadFromDisk() error {
-	return kvs.p.load(kvs)
 }
