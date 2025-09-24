@@ -1,0 +1,6 @@
+// raft.proto defines the Raft protocol
+syntax = "proto3";
+
+package raft;
+
+// TODO: Define Raft messages

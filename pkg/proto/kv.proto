@@ -1,0 +1,6 @@
+// kv.proto defines the KV service protocol
+syntax = "proto3";
+
+package kv;
+
+// TODO: Define KV service messages and service
