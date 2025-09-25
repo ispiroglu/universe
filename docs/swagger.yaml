@@ -1,0 +1,89 @@
+basePath: /
+definitions:
+  http.SetBody:
+    properties:
+      value:
+        items:
+          type: integer
+        type: array
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: A distributed key-value store API
+  title: Universe API
+  version: "1.0"
+paths:
+  /delete/{key}:
+    delete:
+      description: Delete a key-value pair from the store
+      parameters:
+      - description: Key
+        in: path
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Delete key-value pair
+      tags:
+      - kv
+  /get/{key}:
+    get:
+      description: Get the value for a given key
+      parameters:
+      - description: Key
+        in: path
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: key not found
+          schema:
+            type: string
+      summary: Get value by key
+      tags:
+      - kv
+  /set/{key}:
+    post:
+      consumes:
+      - application/json
+      description: Set a key-value pair in the store
+      parameters:
+      - description: Key
+        in: path
+        name: key
+        required: true
+        type: string
+      - description: Value
+        in: body
+        name: value
+        required: true
+        schema:
+          $ref: '#/definitions/http.SetBody'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Set key-value pair
+      tags:
+      - kv
+swagger: "2.0"
