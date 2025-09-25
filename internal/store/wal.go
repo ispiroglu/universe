@@ -3,50 +3,64 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/gob"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
-// OperationType represents the type of mutation recorded in the WAL.
+// TODO: Add log rotation and compaction
+// TODO: is append ok?
+
 type OperationType string
 
 const (
-	// OperationSet indicates a key/value pair should be stored.
-	OperationSet OperationType = "set"
-	// OperationDelete indicates a key should be removed.
+	OperationSet    OperationType = "set"
 	OperationDelete OperationType = "delete"
 )
 
-// ErrCorruptWAL is returned when the WAL file cannot be parsed correctly.
 var ErrCorruptWAL = errors.New("store: wal file is corrupted")
 
-// WALEntry captures a single mutation stored in the write-ahead log.
 type WALEntry struct {
-	Type  OperationType `json:"type"`
-	Key   string        `json:"key"`
-	Value []byte        `json:"value,omitempty"`
+	Type  OperationType
+	Key   string
+	Value []byte
 }
 
 const (
 	walFileMode  = 0o644
 	lengthPrefix = 4
+	checksumSize = 4
+	bufferSize   = 100
 )
 
-// WAL represents the Write-Ahead Log.
+// WAL entry format: [4-byte length][4-byte checksum][payload]
+// The checksum is CRC32 of the payload data
+
 type WAL struct {
 	mu     sync.Mutex
 	path   string
 	file   *os.File
 	writer *bufio.Writer
+
+	flushChan chan struct{}
+	doneChan  chan struct{}
+
+	activeBuffer  []WALEntry
+	pendingBuffer []WALEntry
+	flushMu       sync.Mutex
+
+	wg     sync.WaitGroup
+	ticker *time.Ticker
 }
 
-// NewWAL opens or creates a WAL file at the provided path.
 func NewWAL(path string) (*WAL, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("store: create wal directory: %w", err)
@@ -57,51 +71,44 @@ func NewWAL(path string) (*WAL, error) {
 		return nil, fmt.Errorf("store: open wal: %w", err)
 	}
 
-	return &WAL{
+	wal := &WAL{
 		path:   path,
 		file:   file,
 		writer: bufio.NewWriter(file),
-	}, nil
+
+		flushChan: make(chan struct{}, 1),
+		doneChan:  make(chan struct{}),
+
+		activeBuffer:  make([]WALEntry, 0, bufferSize),
+		pendingBuffer: make([]WALEntry, 0, bufferSize),
+	}
+
+	wal.wg.Add(1)
+	wal.ticker = time.NewTicker(1 * time.Second)
+	go func() {
+		defer wal.wg.Done()
+		wal.asyncFlush(wal.ticker)
+	}()
+
+	return wal, nil
 }
 
-// Append persists an entry to the WAL.
 func (w *WAL) Append(entry WALEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	data, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("store: marshal wal entry: %w", err)
-	}
-
-	var prefix [lengthPrefix]byte
-	binary.BigEndian.PutUint32(prefix[:], uint32(len(data)))
-
-	if _, err = w.writer.Write(prefix[:]); err != nil {
-		return fmt.Errorf("store: write wal length: %w", err)
-	}
-	if _, err = w.writer.Write(data); err != nil {
-		return fmt.Errorf("store: write wal payload: %w", err)
-	}
-	if err = w.writer.Flush(); err != nil {
-		return fmt.Errorf("store: flush wal: %w", err)
-	}
-	if err = w.file.Sync(); err != nil {
-		return fmt.Errorf("store: sync wal: %w", err)
+	w.activeBuffer = append(w.activeBuffer, entry)
+	if len(w.activeBuffer) >= bufferSize {
+		w.flushChan <- struct{}{}
 	}
 
 	return nil
 }
 
-// ReadAll replays all entries stored in the WAL.
 func (w *WAL) ReadAll() ([]WALEntry, error) {
+	w.flushBuffer()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	if err := w.writer.Flush(); err != nil {
-		return nil, fmt.Errorf("store: flush wal before read: %w", err)
-	}
-
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("store: seek wal start: %w", err)
 	}
@@ -109,8 +116,10 @@ func (w *WAL) ReadAll() ([]WALEntry, error) {
 	reader := bufio.NewReader(w.file)
 	entries := make([]WALEntry, 0)
 	lengthBuf := make([]byte, lengthPrefix)
+	checksumBuf := make([]byte, checksumSize)
 
 	for {
+		// Read length prefix
 		if _, err := io.ReadFull(reader, lengthBuf); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -126,6 +135,17 @@ func (w *WAL) ReadAll() ([]WALEntry, error) {
 			return nil, ErrCorruptWAL
 		}
 
+		// Read checksum
+		if _, err := io.ReadFull(reader, checksumBuf); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, ErrCorruptWAL
+			}
+			return nil, fmt.Errorf("store: read wal checksum: %w", err)
+		}
+
+		expectedChecksum := binary.BigEndian.Uint32(checksumBuf)
+
+		// Read payload
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -134,9 +154,18 @@ func (w *WAL) ReadAll() ([]WALEntry, error) {
 			return nil, fmt.Errorf("store: read wal payload: %w", err)
 		}
 
+		// Validate checksum
+		actualChecksum := crc32.ChecksumIEEE(payload)
+		if actualChecksum != expectedChecksum {
+			return nil, fmt.Errorf("store: checksum validation failed for entry (expected: %d, actual: %d): %w", expectedChecksum, actualChecksum, ErrCorruptWAL)
+		}
+
+		// Decode entry
 		var entry WALEntry
-		if err := json.Unmarshal(payload, &entry); err != nil {
-			return nil, fmt.Errorf("store: unmarshal wal entry: %w", err)
+		buf := bytes.NewReader(payload)
+		dec := gob.NewDecoder(buf)
+		if err := dec.Decode(&entry); err != nil {
+			return nil, fmt.Errorf("store: decode wal entry: %w", err)
 		}
 
 		entries = append(entries, entry)
@@ -149,16 +178,74 @@ func (w *WAL) ReadAll() ([]WALEntry, error) {
 	return entries, nil
 }
 
-// Close releases the underlying file descriptor.
 func (w *WAL) Close() error {
+	w.ticker.Stop()
+	close(w.doneChan)
+	w.wg.Wait()
+	w.flushBuffer()
+	return w.file.Close()
+}
+
+func (w *WAL) asyncFlush(t *time.Ticker) {
+	for {
+		select {
+		case <-t.C:
+			w.flushBuffer()
+		case <-w.flushChan:
+			w.flushBuffer()
+		case <-w.doneChan:
+			w.flushBuffer()
+			return
+		}
+	}
+}
+
+func (w *WAL) swapBuffers() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.writer.Flush(); err != nil {
-		return fmt.Errorf("store: flush wal on close: %w", err)
+	if len(w.activeBuffer) == 0 {
+		return
 	}
-	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("store: sync wal on close: %w", err)
+
+	w.activeBuffer, w.pendingBuffer = w.pendingBuffer, w.activeBuffer
+}
+
+func (w *WAL) flushBuffer() {
+	w.swapBuffers()
+
+	w.flushMu.Lock()
+	defer w.flushMu.Unlock()
+
+	for _, entry := range w.pendingBuffer {
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		if err := enc.Encode(entry); err != nil {
+			continue
+		}
+		data := buf.Bytes()
+
+		// Calculate CRC32 checksum of the payload
+		checksum := crc32.ChecksumIEEE(data)
+
+		// Write length prefix
+		var lengthBuf [lengthPrefix]byte
+		binary.BigEndian.PutUint32(lengthBuf[:], uint32(len(data)))
+		w.writer.Write(lengthBuf[:])
+
+		// Write checksum
+		var checksumBuf [checksumSize]byte
+		binary.BigEndian.PutUint32(checksumBuf[:], checksum)
+		w.writer.Write(checksumBuf[:])
+
+		// Write payload
+		w.writer.Write(data)
 	}
-	return w.file.Close()
+
+	w.writer.Flush()
+	w.file.Sync()
+
+	w.mu.Lock()
+	w.pendingBuffer = w.pendingBuffer[:0]
+	w.mu.Unlock()
 }
